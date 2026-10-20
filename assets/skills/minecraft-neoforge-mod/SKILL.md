@@ -128,3 +128,31 @@ gametest 时会抛 `No test functions were given!`（假阴性，用 `runServer`
 
 完整流程（输入挂接代码、截图判读、首启无障碍页坑、5 条验收信号、收尾）见
 `../minecraft-java-build/references/dev-test.md`（该文档覆盖 Paper/Spigot/Fabric/Forge/NeoForge 全平台）。
+
+## 10. Forge 1.20.1 → NeoForge 1.21.1 跨分支同步
+
+同一模组的两个版本常被维护成**互不相干的孤儿分支**：1.21.1 往往是从「初始化移植分支」重开的新根，
+与 1.20.1 **没有共同祖先**。这种仓库里 `git merge-base` 返回空、`git diff main origin/1.21.1`
+会把 400+ 个文件全算成改动——**完全不能用来找差异**。
+
+正确做法：按「**文件存在性 + 提交语义**」比对。
+
+1. 列两边 `src` 的文件清单做差集。真缺口通常只有寥寥几个文件（一边有一边没有），这几个才是重点。
+2. 逐条读上游提交的 diffstat，判断该提交的**语义**是否已在目标侧以**另一种实现**落地过
+   —— 移植时提交信息常被重写，不能靠 `git log` 里的文字对上号。
+3. 最后才看具体文件内容差异。
+
+**API 形态翻译表**（内容照搬，API 形态绝对不能照搬）：
+
+| 1.20.1 Forge | 1.21.1 NeoForge |
+|---|---|
+| `ForgeConfigSpec` / `ForgeConfigSpec.Builder` | `ModConfigSpec` / `ModConfigSpec.Builder` |
+| `addAttributeModifier(attr, uuidStr, v, MULTIPLY_BASE)` | `addAttributeModifier(attr, ResourceLocation, ADD_MULTIPLIED_BASE, amplifier -> …)` |
+| 覆写 `getAttributeModifierValue(amplifier, modifier)` | 上面那条 `amplifier -> …` 曲线（Forge 那个覆写的默认实现本就是 `amount * (amplifier+1)`，所以等价） |
+| `ForgeRegistries.MOB_EFFECTS.getKey(x)` | `BuiltInRegistries.MOB_EFFECT.getKey(x)` |
+| `Map<MobEffect, MobEffectInstance> activeEffects` | `Map<Holder<MobEffect>, MobEffectInstance>` |
+| `ModConfigEvent`（`net.minecraftforge.fml.event.config`） | `net.neoforged.fml.event.config.ModConfigEvent`（有 `Loading`/`Reloading`/`Unloading`） |
+| `CommandSourceStack` / `mods.toml` 时代写法 | `neoforge.mods.toml`（1.21.1 还需 `modLoader="javafml"`） |
+
+最后一条同理的坑：`@Shadow` 字段**类型**写错（`Map<Holder<MobEffect>, …>` 写成 `Map<MobEffect, …>`）
+编译期完全不报错，只在运行时 mixin 应用阶段炸。跨分支同步后必须真跑一次 dev 测试（见 §9）。
