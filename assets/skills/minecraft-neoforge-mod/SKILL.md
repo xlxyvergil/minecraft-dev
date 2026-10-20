@@ -156,3 +156,65 @@ gametest 时会抛 `No test functions were given!`（假阴性，用 `runServer`
 
 最后一条同理的坑：`@Shadow` 字段**类型**写错（`Map<Holder<MobEffect>, …>` 写成 `Map<MobEffect, …>`）
 编译期完全不报错，只在运行时 mixin 应用阶段炸。跨分支同步后必须真跑一次 dev 测试（见 §9）。
+
+### 10.1 逐项核对清单（漏一项就是一次返工）
+
+按顺序过，每项都写清「怎么验」：
+
+- [ ] **版本号**：`mod_version` 常被藏在**功能提交**里，不是只有 `build:` 前缀的提交才会改。
+  实测遇到过「新增某效果」的提交顺手把 1.4.19 升到 1.4.20，只核 `build:` 提交就会漏一版。
+  直接比两侧文件，别靠提交信息猜：
+  `Select-String -Path <repo>\gradle.properties -Pattern '^mod_version'`。
+  目标侧产物名是 `mod_version+minecraft_version` 拼接（如 `tcc-1.4.20+1.21.1.jar`），
+  改完记得确认包内 `neoforge.mods.toml` 的 `version=` 也跟着变了，并删掉 `build/libs` 里的旧产物。
+- [ ] **依赖坐标与级别**：上游 `build.gradle` 每条依赖的 maven 坐标 / fileId、以及
+  `implementation` ↔ `compileOnly` 的**升降级**都要一条条对。等级一变，会连带要求改
+  `*.mods.toml` 的 `[[dependencies]]` 段，以及在主类加 `ModList.get().isLoaded(...)` 运行期守卫。
+- [ ] **mods.toml 依赖段**：新增/删除的 `modId`、`mandatory`、`versionRange` 逐条对齐。
+- [ ] **新类的注册点**：新增的客户端类要在主类的 `Class.forName(...)` 块里登记，
+  否则只在客户端崩、服务端看不出来。
+- [ ] **lang 键**：`zh_cn.json` 和 `en_us.json` 两侧都要加。但**先确认语义是否已在目标侧用别的键实现**
+  —— 例：上游给 `attributeslib.modifier.plus/take` 加兜底，而 1.21.1 侧 `BaseCurioItem`
+  早已改用 `neoforge.modifier.plus/take`，盲目搬过来就是重复且误导。
+- [ ] **mixins 配置**：新增 mixin 类要加进 `*.mixins.json` 的 `mixins` 数组，`compatibilityLevel` 与 JDK 对齐。
+- [ ] **数据文件里的硬编码 modid**：affix / advancement / loot / recipe 等 JSON 里写死的引用
+  （如 `attributeslib:crit_chance`），换依赖后必须跟着换。这类错编译期发现不了，只在运行期静默失效。
+- [ ] **默认值与配置键**：`defineInRange` 的默认值变化、新增的配置项，会让服务端日志出现
+  `<modid>-common.toml is not correct. Correcting` —— 这是**预期**的配置迁移，不是故障。
+- [ ] **删除的文件**：上游删掉的类在目标侧也要删，然后全局搜残留引用（渲染器 / Handler / 注册表 / 资源文件）。
+
+### 10.2 三条实证坑
+
+1. **`MobEffectInstance.duration` 在 1.21 已是私有字段且无 setter**。1.20.1 里
+   `instance.duration = n` 的写法到 1.21 编译不过；`mapDuration()` 只读不写。要压时长可用：
+   构造同参数新实例 + `forceAddEffect(newInst, null)`（别用 `removeEffect`，若该效果有保护守卫会被拦）。
+2. **网络体系整体换了**：1.20.1 的 `SimpleChannel` / `registerMessage`，在 1.21.1 侧往往已迁到
+   NeoForge Payload（`CustomPacketPayload` + `StreamCodec` + `registrar.playToServer/playToClient`，
+   发送用 `PacketDistributor.sendToServer/sendToPlayer`）。新包要照**目标侧既有包**的形态写，
+   不能照搬 1.20.1 的 `record` + `Supplier<NetworkEvent.Context>` + `enqueueWork`。
+   同理：`TickEvent.ClientTickEvent`（带 phase）→ `ClientTickEvent.Post`；
+   `LivingHurtEvent` → `LivingIncomingDamageEvent`；`Tesselator.getBuilder()+DEBUG_LINES` 直连绘制
+   → 自研 `RenderType`（`DEBUG_LINES` + `NO_DEPTH_TEST` + `COLOR_WRITE`）走 `MultiBufferSource`。
+3. **第三方 jar 的元数据可能坏在编码上**——这不是构建配置问题，别在本地反复折腾。
+   现象：FML 报 `File ... is not a valid mod file`，堆栈是
+   `com.electronwill.nightconfig.core.io.ParsingException: Failed to parse data from Reader`。
+   根因：该 jar 的 `META-INF/neoforge.mods.toml` 含**非法 UTF-8 字节**（中文注释被写成 GBK，
+   留下裸 `0xE9` 之类），NightConfig 拒绝解析 → FML 判定整个 mod 无效 → pre-loading 阶段直接失败。
+   定位方法：用 `System.IO.Compression.ZipFile` 取出该 toml 的字节，
+   再用 `new UTF8Encoding($false, $true)` 严格解码，抛异常即坐实；ASCII 段正常、
+   只有注释行报错时，基本就是作者打包时用了非 UTF-8。
+   处置：换一个 fileId（先用同法验证新 jar），或让作者修。
+   临时绕过只能是「本地重打包 + 只改注释编码」，且必须在构建脚本里写清原因与回退方式。
+
+### 10.3 同步完成的判据
+
+`gradlew build` 通过**只证明能编译**。必须再跑 dev 服务端 + 客户端（见 §9），并在日志里确认：
+
+- `Found valid mod file <jar> with {...} mods - versions {...}`：每个依赖 jar 都被判为有效
+  （这一行缺失或变成 `not a valid mod file`，就是 §10.2 第 3 条）
+- `Preparing <modid>.mixins.json (N)`：N 与 `*.mixins.json` 里的类数一致
+- 每个新 mixin 都有 `Mixing XxxMixin from ... into <目标类>`，
+  且注入方法没有 `has 0 overrides` / `won't be passed a CallbackInfo` 之外的异常提示
+- 客户端日志出现 `Minecraft NeoForge* <版本> - Multiplayer`，服务端出现 `<玩家> joined the game`
+- 全程日志里**自己的包名一次都不出现在异常堆栈中**（这条比「没有 ERROR 字样」可靠得多，
+  因为别的 mod 的良性警告会混进 ERROR 关键字）
